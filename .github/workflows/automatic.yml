@@ -44,3 +44,17 @@ jobs:
           path: scripts.json
           retention-days: 3
           if-no-files-found: error
+
+      - name: Install voice engine
+        run: pip install edge-tts
+
+      - name: Generate voice
+        run: python voice.py
+
+      - name: Save audio files
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-audio
+          path: '**/*.mp3'
+          retention-days: 3
+          if-no-files-found: error
