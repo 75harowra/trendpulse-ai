@@ -16,6 +16,7 @@ except ImportError:
 VOICE = "en-US-GuyNeural"
 
 os.makedirs("audio", exist_ok=True)
+os.makedirs("subtitles", exist_ok=True)
 
 with open("scripts.json", "r", encoding="utf-8") as f:
     data = json.load(f)
@@ -29,20 +30,33 @@ async def main():
         if not isinstance(text, str) or not text.strip():
             raise ValueError("Invalid video script")
 
-        filename = f"audio/video_{i}.mp3"
+        audio_file = f"audio/video_{i}.mp3"
+        subtitle_file = f"subtitles/video_{i}.srt"
 
-        print(f"Generating voice {i}...")
+        print(f"Generating voice and subtitles {i}...")
 
         communicate = edge_tts.Communicate(
             text=text,
             voice=VOICE,
-            rate="+0%"
+            rate="+0%",
+            boundary="SentenceBoundary"
         )
 
-        await communicate.save(filename)
+        submaker = edge_tts.SubMaker()
 
-        print(f"SUCCESS: {filename}")
+        with open(audio_file, "wb") as audio:
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    audio.write(chunk["data"])
+                elif chunk["type"] == "SentenceBoundary":
+                    submaker.feed(chunk)
 
-    print("All audio files generated successfully")
+        with open(subtitle_file, "w", encoding="utf-8") as f:
+            f.write(submaker.get_srt())
+
+        print(f"SUCCESS: {audio_file}")
+        print(f"SUCCESS: {subtitle_file}")
+
+    print("All audio and subtitles generated successfully")
 
 asyncio.run(main())
