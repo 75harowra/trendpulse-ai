@@ -11,7 +11,7 @@ permissions:
 jobs:
   trendpulse:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repository
@@ -56,5 +56,21 @@ jobs:
         with:
           name: video-audio
           path: '**/*.mp3'
+          retention-days: 3
+          if-no-files-found: error
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Generate videos
+        run: python video.py
+
+      - name: Save finished videos
+        uses: actions/upload-artifact@v4
+        with:
+          name: finished-videos
+          path: videos/*.mp4
           retention-days: 3
           if-no-files-found: error
