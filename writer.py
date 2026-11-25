@@ -1,9 +1,13 @@
+
 import os
 import json
 import urllib.request
 import urllib.error
 
-API_KEY = os.environ["GROQ_API_KEY"].strip()
+API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
+
+if not API_KEY:
+    raise SystemExit("Missing GROQ_API_KEY")
 
 with open("trends.json", "r", encoding="utf-8") as f:
     trends = json.load(f)
@@ -12,30 +16,41 @@ prompt = f"""
 You are a professional YouTube content creator.
 
 Analyze these trending topics:
+
 {json.dumps(trends, ensure_ascii=False)}
 
-Choose the 3 best topics.
+Choose the 3 best trending topics.
 
 For each topic create:
+
 - Engaging YouTube title
 - Strong opening hook
-- 3 to 5 minute video script
+- Full 3 to 5 minute video script
 - Video description
-- 10 hashtags
+- 10 relevant hashtags
 - Thumbnail idea
+- Suggested visual scenes
 
 Write everything in English.
+Make the content original and engaging.
 Do not invent facts.
+Flag information that needs verification.
 Return valid JSON only, as an object.
 """
 
 data = {
-    "model": "llama-3.3-70b-versatile",
+    "model": "openai/gpt-oss-120b",
     "messages": [
-        {"role": "user", "content": prompt}
+        {
+            "role": "user",
+            "content": prompt
+        }
     ],
     "temperature": 0.7,
-    "response_format": {"type": "json_object"}
+    "max_completion_tokens": 8192,
+    "response_format": {
+        "type": "json_object"
+    }
 }
 
 request = urllib.request.Request(
