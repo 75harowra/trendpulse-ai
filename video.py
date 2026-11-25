@@ -14,16 +14,22 @@ API_KEY = os.getenv("PIXABAY_API_KEY")
 if not API_KEY:
     raise RuntimeError("Missing PIXABAY_API_KEY")
 
+WIDTH = 1920
+HEIGHT = 1080
+FPS = 25
+SCENE_TIME = 6
+MAX_MEDIA = 35
+
 output = Path("videos")
 output.mkdir(exist_ok=True)
 
 with open("scripts.json", encoding="utf-8") as f:
-    data = json.load(f)
-
-topics = data["selected_topics"]
+    topics = json.load(f)["selected_topics"]
 
 session = requests.Session()
 cache = {}
+
+FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
 
 def run(cmd):
@@ -41,38 +47,58 @@ def duration(path):
 
 
 def keywords(title, item):
-    words = []
-
-    topic = item.get("topic")
-    if isinstance(topic, str):
-        words.append(topic)
-
-    words.append(title.split(":")[0])
-
-    low = title.lower()
+    queries = []
+    topic = str(item.get("topic") or "")
+    script = str(item.get("script") or "")
+    content = (title + " " + topic + " " + script).lower()
 
     categories = {
-        "basketball": ["nba", "76ers", "basketball", "heat"],
-        "football": ["soccer", "football", "goal", "fifa"],
-        "social media smartphone": [
-            "social media", "viral", "influencer",
-            "celebrity", "tiktok"
+        "basketball": [
+            "nba", "76ers", "basketball"
         ],
-        "technology": ["robot", "ai ", "technology"],
-        "finance": ["money", "stock", "economy"],
-        "space": ["space", "nasa", "planet"],
-        "weather": ["storm", "weather", "rain"]
+        "football": [
+            "soccer", "football", "fifa"
+        ],
+        "robot technology": [
+            "robot", "robotics"
+        ],
+        "artificial intelligence": [
+            "artificial intelligence", "chatgpt"
+        ],
+        "social media smartphone": [
+            "social media", "influencer", "tiktok"
+        ],
+        "stock market": [
+            "stock market", "finance", "economy"
+        ],
+        "space exploration": [
+            "nasa", "planet", "space"
+        ],
+        "storm weather": [
+            "storm", "hurricane", "weather"
+        ],
+        "electric car": [
+            "electric vehicle", "electric car", "tesla"
+        ],
+        "computer technology": [
+            "computer", "software", "technology"
+        ]
     }
 
+    if topic:
+        queries.append(topic[:100])
+
+    queries.append(title.split(":")[0][:100])
+
     for category, triggers in categories.items():
-        if any(x in low for x in triggers):
-            words.append(category)
+        if any(word in content for word in triggers):
+            queries.append(category)
 
     clean = re.sub(r"[^a-zA-Z0-9 ]", " ", title)
-    words.append(" ".join(clean.split()[:3]))
+    queries.append(" ".join(clean.split()[:4]))
 
     return list(dict.fromkeys(
-        x.strip()[:100] for x in words if x.strip()
+        q.strip() for q in queries if q.strip()
     ))
 
 
@@ -89,8 +115,8 @@ def search(query, media):
 
     params = {
         "key": API_KEY,
-        "q": query,
-        "per_page": 10,
+        "q": query[:100],
+        "per_page": 30,
         "safesearch": "true"
     }
 
@@ -114,23 +140,30 @@ def search(query, media):
         return hits
 
     except (requests.RequestException, ValueError):
-        print("Search unavailable")
         return []
 
 
 def download(url, path):
     with session.get(
-        url, timeout=60, stream=True
+        url, stream=True, timeout=60
     ) as response:
+
         response.raise_for_status()
+
+        size = 0
 
         with open(path, "wb") as f:
             for chunk in response.iter_content(65536):
                 if chunk:
+                    size += len(chunk)
+
+                    if size > 40 * 1024 * 1024:
+                        raise ValueError("Media too large")
+
                     f.write(chunk)
 
 
-def get_media(title, item, folder):
+def get_media(title, item, folder, limit):
     queries = keywords(title, item)
     files = []
     sources = []
@@ -150,11 +183,14 @@ def get_media(title, item, folder):
 
                 if media == "video":
                     versions = hit.get("videos", {})
+
                     url = (
                         versions.get("medium", {}).get("url")
                         or versions.get("small", {}).get("url")
                     )
+
                     ext = ".mp4"
+
                 else:
                     url = hit.get("largeImageURL")
                     ext = ".jpg"
@@ -166,61 +202,67 @@ def get_media(title, item, folder):
 
                 try:
                     download(url, path)
+
                     files.append(path)
+
                     sources.append({
                         "url": hit.get("pageURL"),
                         "author": hit.get("user"),
-                        "query": query
+                        "query": query,
+                        "type": media
                     })
 
+                    print(
+                        "Downloaded media:", len(files),
+                        flush=True
+                    )
+
                 except Exception:
-                    print("Media download skipped")
                     path.unlink(missing_ok=True)
+                    continue
 
-                if len(files) >= 6:
+                if len(files) >= limit:
                     return files, sources
-
-            if len(files) >= 3:
-                return files, sources
 
     return files, sources
 
 
 def make_scene(source, target, seconds):
-    base_filter = (
-        "scale=1280:720:"
+    base = (
+        f"scale={WIDTH}:{HEIGHT}:"
         "force_original_aspect_ratio=increase,"
-        "crop=1280:720,setsar=1"
+        f"crop={WIDTH}:{HEIGHT},setsar=1"
     )
 
     if source.suffix.lower() == ".jpg":
-        frames = max(1, math.ceil(seconds * 25))
+        frames = max(1, math.ceil(seconds * FPS))
 
         command = [
             "ffmpeg", "-y",
             "-i", str(source),
             "-vf",
-            base_filter + ","
-            "zoompan=z='min(zoom+0.0007,1.12)':"
+            base + ","
+            "zoompan=z='min(zoom+0.0005,1.10)':"
             "x='iw/2-iw/zoom/2':"
             "y='ih/2-ih/zoom/2':"
-            f"d={frames}:s=1280x720:fps=25"
+            f"d={frames}:s={WIDTH}x{HEIGHT}:fps={FPS}"
         ]
+
     else:
         command = [
             "ffmpeg", "-y",
             "-stream_loop", "-1",
             "-i", str(source),
-            "-vf", base_filter
+            "-vf", base
         ]
 
     command += [
         "-t", f"{seconds:.3f}",
         "-an",
-        "-r", "25",
+        "-r", str(FPS),
         "-c:v", "libx264",
         "-threads", "2",
-        "-preset", "veryfast",
+        "-preset", "ultrafast",
         "-crf", "23",
         "-pix_fmt", "yuv420p",
         "-loglevel", "error",
@@ -228,6 +270,37 @@ def make_scene(source, target, seconds):
     ]
 
     run(command)
+
+
+def fallback_scene(target, seconds):
+    run([
+        "ffmpeg", "-y",
+        "-f", "lavfi",
+        "-i",
+        f"color=c=0x101B35:s={WIDTH}x{HEIGHT}:r={FPS}",
+        "-t", str(seconds),
+        "-an",
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-threads", "2",
+        "-pix_fmt", "yuv420p",
+        "-loglevel", "error",
+        str(target)
+    ])
+
+
+def find_subtitles(index):
+    candidates = [
+        Path(f"audio/video_{index}.srt"),
+        Path(f"subtitles/video_{index}.srt"),
+        Path(f"captions/video_{index}.srt")
+    ]
+
+    for path in candidates:
+        if path.exists() and path.stat().st_size > 0:
+            return path.resolve()
+
+    return None
 
 
 def make_video(index, item):
@@ -248,24 +321,27 @@ def make_video(index, item):
     if total <= 0:
         raise RuntimeError("Invalid audio duration")
 
+    count = math.ceil(total / SCENE_TIME)
+
     print("Creating:", title, flush=True)
 
     with tempfile.TemporaryDirectory() as temp:
         folder = Path(temp)
 
         media, sources = get_media(
-            title, item, folder
+            title,
+            item,
+            folder,
+            min(count, MAX_MEDIA)
         )
 
-        if not media:
-            print("No media found. Skipping topic.")
-            return False
-
         scenes = []
-        count = math.ceil(total / 7)
 
         for n in range(count):
-            seconds = min(7, total - n * 7)
+            seconds = min(
+                SCENE_TIME,
+                total - n * SCENE_TIME
+            )
 
             if seconds <= 0:
                 break
@@ -277,6 +353,8 @@ def make_video(index, item):
                 flush=True
             )
 
+            created = False
+
             for offset in range(len(media)):
                 source = media[
                     (n + offset) % len(media)
@@ -284,14 +362,16 @@ def make_video(index, item):
 
                 try:
                     make_scene(source, scene, seconds)
-                    scenes.append(scene)
+                    created = True
                     break
 
                 except subprocess.CalledProcessError:
                     scene.unlink(missing_ok=True)
 
-            else:
-                raise RuntimeError("No usable media")
+            if not created:
+                fallback_scene(scene, seconds)
+
+            scenes.append(scene)
 
         concat = folder / "concat.txt"
 
@@ -300,13 +380,6 @@ def make_video(index, item):
                 f"file '{p.as_posix()}'"
                 for p in scenes
             ),
-            encoding="utf-8"
-        )
-
-        title_file = folder / "title.txt"
-
-        title_file.write_text(
-            textwrap.fill(title, width=46),
             encoding="utf-8"
         )
 
@@ -322,25 +395,55 @@ def make_video(index, item):
             str(combined)
         ])
 
+        title_file = folder / "title.txt"
+
+        title_file.write_text(
+            textwrap.fill(title, width=38),
+            encoding="utf-8"
+        )
+
         filters = (
             "drawbox=x=0:y=0:w=iw:h=10:"
             "color=cyan:t=fill,"
-            "drawtext=text='TRENDPULSE AI':"
-            "fontsize=30:fontcolor=white:"
-            "box=1:boxcolor=black@0.6:"
-            "x=25:y=25,"
-            f"drawtext=textfile={title_file}:"
-            "expansion=none:"
-            "fontsize=32:fontcolor=white:"
+            f"drawtext=fontfile={FONT}:"
+            "text='TRENDPULSE AI':"
+            "fontsize=38:fontcolor=white:"
             "box=1:boxcolor=black@0.7:"
-            "boxborderw=12:"
-            "x=(w-tw)/2:y=h-th-50:"
-            "enable='lt(t,8)',"
+            "boxborderw=12:x=40:y=40,"
+            f"drawtext=fontfile={FONT}:"
+            f"textfile={title_file}:"
+            "expansion=none:"
+            "fontsize=48:fontcolor=white:"
+            "box=1:boxcolor=black@0.75:"
+            "boxborderw=18:"
+            "x=(w-tw)/2:y=(h-th)/2:"
+            "enable='lt(t,6)',"
             "drawtext=text='Illustrative footage':"
-            "fontsize=19:fontcolor=white:"
+            "fontsize=24:fontcolor=white:"
             "box=1:boxcolor=black@0.6:"
-            "x=25:y=h-35"
+            "x=30:y=h-40"
         )
+
+        subtitles = find_subtitles(index)
+
+        if subtitles:
+            filters += (
+                f",subtitles={subtitles.as_posix()}:"
+                "force_style='FontName=DejaVu Sans,"
+                "FontSize=22,Bold=1,"
+                "PrimaryColour=&H00FFFFFF,"
+                "OutlineColour=&H00000000,"
+                "Outline=2,Shadow=1,"
+                "Alignment=2,MarginV=25'"
+            )
+
+            print("Subtitles added", flush=True)
+
+        else:
+            print(
+                "No SRT subtitles found",
+                flush=True
+            )
 
         temporary = folder / "final.mp4"
 
@@ -355,9 +458,9 @@ def make_video(index, item):
             "-c:v", "libx264",
             "-preset", "veryfast",
             "-threads", "2",
-            "-crf", "23",
+            "-crf", "22",
             "-c:a", "aac",
-            "-b:a", "128k",
+            "-b:a", "192k",
             "-pix_fmt", "yuv420p",
             "-t", str(total),
             "-movflags", "+faststart",
@@ -385,11 +488,10 @@ for index, item in enumerate(topics, 1):
 
     except Exception as error:
         print(
-            f"Video {index} skipped: "
-            f"{type(error).__name__}",
+            f"Video {index} failed: "
+            f"{type(error).__name__}: {error}",
             flush=True
         )
-        continue
 
 print(f"Finished: {success}/{len(topics)} videos")
 
