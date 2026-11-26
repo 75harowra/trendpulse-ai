@@ -4,19 +4,21 @@ import json
 import math
 import re
 import html
+import hashlib
 import requests
 import subprocess
 import tempfile
 import textwrap
 from pathlib import Path
 
+VERSION = "4.0"
 API_KEY = os.getenv("PIXABAY_API_KEY")
 
 WIDTH = 1920
 HEIGHT = 1080
 FPS = 25
-SCENE_TIME = 6
-MAX_MEDIA = 20
+SCENE_TIME = 5
+MAX_MEDIA = 32
 
 FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
@@ -28,7 +30,7 @@ with open("scripts.json", encoding="utf-8") as f:
 
 session = requests.Session()
 session.headers.update({
-    "User-Agent": "TrendPulseGlobal/3.0 (https://github.com/75harowra/trendpulse-ai)"
+    "User-Agent": "TrendPulseGlobal/4.0"
 })
 
 cache = {}
@@ -38,11 +40,22 @@ def run(cmd):
     subprocess.run(cmd, check=True)
 
 
+def ffmpeg(args):
+    run([
+        "ffmpeg", "-y",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-filter_threads", "2",
+        "-filter_complex_threads", "2"
+    ] + args)
+
+
 def duration(path):
     result = subprocess.check_output([
         "ffprobe", "-v", "error",
         "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
         str(path)
     ])
     return float(result.strip())
@@ -55,9 +68,10 @@ def clean(value):
 
 
 def keywords(item):
-    title = str(item.get("title", ""))
-    topic = str(item.get("topic", ""))
-    content = (title + " " + topic).lower()
+    content = (
+        str(item.get("title", "")) + " " +
+        str(item.get("topic", ""))
+    ).lower()
 
     queries = item.get("visual_keywords", [])
 
@@ -72,55 +86,133 @@ def keywords(item):
 
     categories = [
         (
-            ["nba", "basketball", "wembanyama",
-             "anunoby", "jrue holiday"],
-            ["basketball", "basketball player",
-             "basketball court"]
+            r"\b(ai|robot|chatgpt|artificial intelligence|machine learning)\b",
+            [
+                "artificial intelligence",
+                "robot technology",
+                "data center",
+                "computer chip",
+                "neural network"
+            ]
         ),
         (
-            ["nfl", "american football", "garrett"],
-            ["american football", "football helmet"]
+            r"\b(inflation|prices|cost of living|groceries)\b",
+            [
+                "grocery shopping",
+                "supermarket shelves",
+                "shopping cart",
+                "grocery receipt",
+                "money counting"
+            ]
         ),
         (
-            ["soccer", "fifa", "football"],
-            ["soccer", "soccer stadium"]
+            r"\b(electric car|electric vehicle|tesla|hybrid car)\b",
+            [
+                "electric car",
+                "car charging",
+                "car factory",
+                "electric battery"
+            ]
         ),
         (
-            ["artificial intelligence", "robot", "chatgpt"],
-            ["robot technology", "computer processor"]
+            r"\b(economy|finance|stock market|banking)\b",
+            [
+                "stock market",
+                "financial chart",
+                "business meeting",
+                "money counting"
+            ]
         ),
         (
-            ["electric car", "tesla", "electric vehicle"],
-            ["electric car", "car charging"]
+            r"\b(nba|basketball|wembanyama)\b",
+            [
+                "basketball",
+                "basketball player",
+                "basketball court"
+            ]
         ),
         (
-            ["finance", "economy", "stock market"],
-            ["financial chart", "stock market"]
+            r"\b(nfl|american football)\b",
+            [
+                "american football",
+                "football helmet"
+            ]
         ),
         (
-            ["space", "nasa", "rocket"],
-            ["rocket launch", "space exploration"]
+            r"\b(soccer|fifa|football)\b",
+            [
+                "soccer player",
+                "soccer stadium"
+            ]
         ),
         (
-            ["marketing", "social media", "viral"],
-            ["digital marketing", "social media"]
+            r"\b(space|nasa|rocket|satellite)\b",
+            [
+                "rocket launch",
+                "space exploration",
+                "satellite",
+                "planet earth"
+            ]
+        ),
+        (
+            r"\b(technology|innovation|invention)\b",
+            [
+                "computer technology",
+                "engineering laboratory",
+                "electronics"
+            ]
         )
     ]
 
-    for triggers, extra in categories:
-        if any(word in content for word in triggers):
+    for pattern, extra in categories:
+        if re.search(pattern, content):
             queries.extend(extra)
             break
 
-    if not queries and topic:
-        queries.append(topic[:100])
+    if not queries:
+        queries.append(
+            str(item.get("topic", ""))[:100]
+        )
 
-    return list(dict.fromkeys(queries))[:8]
+    return list(dict.fromkeys(
+        q for q in queries if q
+    ))[:12]
+
+
+def relevant(tags, query):
+    tags = str(tags).lower()
+
+    ignored = {
+        "the", "and", "with", "for",
+        "news", "today", "global"
+    }
+
+    words = [
+        w for w in re.findall(
+            r"[a-z0-9]+", query.lower()
+        )
+        if len(w) > 2 and w not in ignored
+    ]
+
+    if not words:
+        return False
+
+    matches = sum(
+        bool(re.search(
+            r"\b" + re.escape(w) + r"s?\b",
+            tags
+        ))
+        for w in words
+    )
+
+    return matches == len(words)
 
 
 def download(url, path):
     with session.get(
-        url, stream=True, timeout=45
+        url,
+        stream=True,
+        timeout=45
     ) as response:
 
         response.raise_for_status()
@@ -133,8 +225,8 @@ def download(url, path):
 
                 size += len(chunk)
 
-                if size > 35 * 1024 * 1024:
-                    raise ValueError("File too large")
+                if size > 45 * 1024 * 1024:
+                    raise ValueError("Media too large")
 
                 f.write(chunk)
 
@@ -145,10 +237,13 @@ def valid_media(path):
             "ffprobe", "-v", "error",
             "-select_streams", "v:0",
             "-show_entries", "stream=width,height",
-            "-of", "json", str(path)
+            "-of", "json",
+            str(path)
         ])
 
-        streams = json.loads(result).get("streams", [])
+        streams = json.loads(result).get(
+            "streams", []
+        )
 
         return bool(
             streams
@@ -177,61 +272,36 @@ def search_pixabay(query, media):
     params = {
         "key": API_KEY,
         "q": query,
-        "per_page": 20,
+        "per_page": 30,
         "safesearch": "true",
         "order": "popular"
     }
 
     if media == "image":
         params["image_type"] = "photo"
+        params["orientation"] = "horizontal"
 
     try:
         response = session.get(
             endpoint,
             params=params,
-            timeout=30
+            timeout=25
         )
 
         response.raise_for_status()
 
         hits = response.json().get("hits", [])
         cache[key] = hits
+
         return hits
 
-    except Exception:
+    except Exception as error:
+        print(
+            "Pixabay search failed:",
+            type(error).__name__,
+            flush=True
+        )
         return []
-
-
-def relevant(tags, query):
-    tags = str(tags).lower()
-
-    words = re.findall(
-        r"[a-z0-9]+", query.lower()
-    )
-
-    ignored = {
-        "the", "and", "with", "for",
-        "news", "today", "global",
-        "professional"
-    }
-
-    words = [
-        w for w in words
-        if len(w) > 2 and w not in ignored
-    ]
-
-    if not words:
-        return False
-
-    matches = sum(
-        bool(re.search(
-            r"\b" + re.escape(w) + r"s?\b",
-            tags
-        ))
-        for w in words
-    )
-
-    return matches == len(words)
 
 
 def search_commons(query):
@@ -245,7 +315,7 @@ def search_commons(query):
         "generator": "search",
         "gsrsearch": query + " filetype:bitmap",
         "gsrnamespace": 6,
-        "gsrlimit": 15,
+        "gsrlimit": 12,
         "prop": "imageinfo",
         "iiprop": "url|mime|size|extmetadata",
         "iiurlwidth": 1280,
@@ -258,7 +328,7 @@ def search_commons(query):
         response = session.get(
             "https://commons.wikimedia.org/w/api.php",
             params=params,
-            timeout=30
+            timeout=25
         )
 
         response.raise_for_status()
@@ -278,13 +348,28 @@ def search_commons(query):
             if info.get("mime") != "image/jpeg":
                 continue
 
+            title = page.get("title", "")
+
+            if re.search(
+                r"diagram|schematic|circuit|document|logo|map|drawing",
+                title,
+                re.I
+            ):
+                continue
+
+            if not relevant(title, query):
+                continue
+
             meta = info.get("extmetadata", {})
 
-            license_name = clean(
-                meta.get(
-                    "LicenseShortName", {}
-                ).get("value", "")
-            )
+            def field(name):
+                return clean(
+                    meta.get(name, {}).get("value", "")
+                )
+
+            license_name = field("LicenseShortName")
+            author = field("Artist")
+            license_url = field("LicenseUrl")
 
             allowed = {
                 "CC0",
@@ -297,37 +382,17 @@ def search_commons(query):
             if license_name not in allowed:
                 continue
 
-            author = clean(
-                meta.get(
-                    "Artist", {}
-                ).get("value", "")
-            )
-
-            license_url = clean(
-                meta.get(
-                    "LicenseUrl", {}
-                ).get("value", "")
-            )
-
-            restrictions = clean(
-                meta.get(
-                    "Restrictions", {}
-                ).get("value", "")
-            )
-
-            if restrictions:
+            if field("Restrictions"):
                 continue
 
             if license_name.startswith("CC BY"):
                 if not author or not license_url:
                     continue
 
-            title = page.get("title", "")
-
-            if not relevant(title, query):
-                continue
-
-            url = info.get("thumburl") or info.get("url")
+            url = (
+                info.get("thumburl")
+                or info.get("url")
+            )
 
             if not url:
                 continue
@@ -336,8 +401,8 @@ def search_commons(query):
                 "id": page.get("pageid"),
                 "url": url,
                 "page": info.get("descriptionurl", ""),
-                "author": author,
                 "title": title,
+                "author": author,
                 "license": license_name,
                 "license_url": license_url,
                 "provider": "Wikimedia Commons",
@@ -347,7 +412,10 @@ def search_commons(query):
         cache[key] = results
 
     except Exception as error:
-        print("Commons search:", error)
+        print(
+            "Commons search failed:",
+            type(error).__name__
+        )
 
     return results
 
@@ -356,22 +424,14 @@ def get_media(item, folder, limit):
     files = []
     sources = []
     seen = set()
+    hashes = set()
 
     queries = keywords(item)
 
     print("Visual keywords:", queries, flush=True)
 
-    topic = str(item.get("topic", "")).strip()
-
-    commons_queries = list(dict.fromkeys(
-        ([topic[:100]] if topic else []) + queries
-    ))
-
     def save(url, extension, source, identity):
-        if identity in seen:
-            return False
-
-        if len(files) >= limit:
+        if identity in seen or len(files) >= limit:
             return False
 
         seen.add(identity)
@@ -386,38 +446,41 @@ def get_media(item, folder, limit):
             if not valid_media(path):
                 raise ValueError("Invalid media")
 
+            digest = hashlib.sha256(
+                path.read_bytes()
+            ).hexdigest()
+
+            if digest in hashes:
+                raise ValueError("Duplicate media")
+
+            hashes.add(digest)
             files.append(path)
             sources.append(source)
+
             return True
 
         except Exception:
             path.unlink(missing_ok=True)
             return False
 
-    for query in commons_queries:
-        for hit in search_commons(query):
-            if save(
-                hit["url"],
-                ".jpg",
-                hit,
-                ("commons", hit["id"])
-            ):
-                if len(files) >= min(6, limit):
-                    break
-
-        if len(files) >= min(6, limit):
-            break
-
-    for query in queries:
-        for media in ["video", "image"]:
+    # Moving footage first.
+    for media in ["video", "image"]:
+        for query in queries:
             added = 0
 
             for hit in search_pixabay(query, media):
                 if len(files) >= limit:
                     return files, sources
 
-                if not relevant(
-                    hit.get("tags", ""), query
+                tags = hit.get("tags", "")
+
+                if not relevant(tags, query):
+                    continue
+
+                if re.search(
+                    r"\b(diagram|schematic|logo|document)\b",
+                    tags,
+                    re.I
                 ):
                     continue
 
@@ -425,12 +488,8 @@ def get_media(item, folder, limit):
                     versions = hit.get("videos", {})
 
                     url = (
-                        versions.get(
-                            "medium", {}
-                        ).get("url")
-                        or versions.get(
-                            "small", {}
-                        ).get("url")
+                        versions.get("medium", {}).get("url")
+                        or versions.get("small", {}).get("url")
                     )
 
                     extension = ".mp4"
@@ -464,35 +523,85 @@ def get_media(item, folder, limit):
                 if added >= 2:
                     break
 
+    # Commons is only a fallback.
+    if len(files) < limit:
+        for query in queries:
+            for hit in search_commons(query):
+                if len(files) >= limit:
+                    return files, sources
+
+                if save(
+                    hit["url"],
+                    ".jpg",
+                    hit,
+                    ("commons", hit["id"])
+                ):
+                    break
+
+    print("Media collected:", len(files), flush=True)
+
     return files, sources
 
 
-def make_scene(source, target, seconds):
-    base = (
-        f"scale={WIDTH}:{HEIGHT}:"
-        "force_original_aspect_ratio=decrease,"
-        f"pad={WIDTH}:{HEIGHT}:"
-        "(ow-iw)/2:(oh-ih)/2:"
-        "color=0x142238,"
-        "setsar=1"
-    )
-
-    command = ["ffmpeg", "-y"]
+def make_scene(
+    source,
+    target,
+    seconds,
+    width=WIDTH,
+    height=HEIGHT,
+    variant=0
+):
+    frames = max(1, round(seconds * FPS))
 
     if source.suffix.lower() == ".jpg":
-        command += [
-            "-loop", "1",
-            "-i", str(source)
-        ]
+
+        if variant % 2 == 0:
+            zoom = "min(zoom+0.0008,1.12)"
+        else:
+            zoom = "max(1.12-on*0.0008,1.0)"
+
+        filters = (
+            f"scale={width}:{height}:"
+            "force_original_aspect_ratio=increase,"
+            f"crop={width}:{height},"
+            f"zoompan=z='{zoom}':"
+            "x='iw/2-iw/zoom/2':"
+            "y='ih/2-ih/zoom/2':"
+            f"d={frames}:"
+            f"s={width}x{height}:fps={FPS},"
+            "setsar=1"
+        )
+
+        command = ["-i", str(source)]
+
     else:
-        command += [
+        filters = (
+            f"scale={width}:{height}:"
+            "force_original_aspect_ratio=increase,"
+            f"crop={width}:{height},"
+            f"fps={FPS},setsar=1"
+        )
+
+        start = 0
+
+        try:
+            available = duration(source)
+            start = min(
+                variant * 1.5,
+                max(0, available - seconds)
+            )
+        except Exception:
+            pass
+
+        command = [
             "-stream_loop", "-1",
+            "-ss", str(start),
             "-i", str(source)
         ]
 
-    command += [
-        "-vf", base,
-        "-t", f"{seconds:.3f}",
+    ffmpeg(command + [
+        "-vf", filters,
+        "-frames:v", str(frames),
         "-an",
         "-r", str(FPS),
         "-c:v", "libx264",
@@ -500,18 +609,17 @@ def make_scene(source, target, seconds):
         "-preset", "veryfast",
         "-crf", "23",
         "-pix_fmt", "yuv420p",
-        "-loglevel", "error",
         str(target)
-    ]
-
-    run(command)
+    ])
 
 
-def find_subtitles(index):
+def find_subtitles(index, short=False):
+    prefix = "short" if short else "video"
+
     candidates = [
-        Path(f"audio/video_{index}.srt"),
-        Path(f"subtitles/video_{index}.srt"),
-        Path(f"captions/video_{index}.srt")
+        Path(f"audio/{prefix}_{index}.srt"),
+        Path(f"subtitles/{prefix}_{index}.srt"),
+        Path(f"captions/{prefix}_{index}.srt")
     ]
 
     for path in candidates:
@@ -528,10 +636,13 @@ def make_thumbnail(index, item, media, folder):
         or "TRENDING NOW"
     )
 
-    headline = " ".join(headline.split()[:4])
+    headline = " ".join(
+        headline.split()[:4]
+    ).upper()
+
     headline = textwrap.fill(
-        headline.upper(),
-        width=18
+        headline,
+        width=17
     )
 
     text_file = folder / "thumbnail.txt"
@@ -544,42 +655,44 @@ def make_thumbnail(index, item, media, folder):
         "scale=1280:720:"
         "force_original_aspect_ratio=increase,"
         "crop=1280:720,"
-        "drawbox=x=0:y=450:w=iw:h=270:"
-        "color=0x071329@0.85:t=fill,"
-        "drawbox=x=0:y=450:w=iw:h=8:"
+        "drawbox=x=0:y=430:w=iw:h=290:"
+        "color=0x071329@0.78:t=fill,"
+        "drawbox=x=0:y=430:w=iw:h=7:"
         "color=yellow:t=fill,"
         f"drawtext=fontfile={FONT}:"
         "text='TRENDPULSE GLOBAL':"
         "fontsize=30:fontcolor=white:"
-        "box=1:boxcolor=0x071329@0.8:"
+        "box=1:boxcolor=0x071329@0.9:"
         "boxborderw=12:x=30:y=30,"
         f"drawtext=fontfile={FONT}:"
         f"textfile={text_file}:"
         "expansion=none:"
-        "fontsize=64:fontcolor=yellow:"
-        "borderw=3:bordercolor=black:"
-        "x=(w-tw)/2:y=460+(250-th)/2"
+        "fontsize=70:fontcolor=yellow:"
+        "borderw=4:bordercolor=black:"
+        "x=(w-tw)/2:y=440+(270-th)/2"
     )
 
     target = output / f"thumbnail_{index}.jpg"
 
-    for source in media:
+    ordered = sorted(
+        media,
+        key=lambda p: p.suffix != ".jpg"
+    )
+
+    for source in ordered:
         try:
-            command = ["ffmpeg", "-y"]
+            command = []
 
             if source.suffix == ".mp4":
-                command += ["-ss", "1"]
+                command += ["-ss", "0.5"]
 
-            command += [
+            ffmpeg(command + [
                 "-i", str(source),
                 "-vf", filters,
                 "-frames:v", "1",
                 "-q:v", "3",
-                "-loglevel", "error",
                 str(target)
-            ]
-
-            run(command)
+            ])
 
             if target.exists() and target.stat().st_size:
                 return
@@ -597,10 +710,16 @@ def save_credits(index, item, sources):
     for source in sources:
         page = source.get("page", "")
 
-        if page in seen:
+        identity = (
+            page,
+            source.get("author", ""),
+            source.get("query", "")
+        )
+
+        if identity in seen:
             continue
 
-        seen.add(page)
+        seen.add(identity)
 
         credits.append(
             f"{source.get('title', source.get('query', 'Media'))}\n"
@@ -608,7 +727,7 @@ def save_credits(index, item, sources):
             f"Source: {page}\n"
             f"License: {source.get('license', '')}\n"
             f"{source.get('license_url', '')}\n"
-            "Changes: resized, cropped or text overlay.\n"
+            "Changes: cropped, resized, animated or text overlay.\n"
         )
 
     credit_text = "\n".join(credits)
@@ -628,9 +747,9 @@ def save_credits(index, item, sources):
     )
 
     details = dict(item)
-
     details["media_credits"] = credit_text
     details["review_required"] = True
+    details["version"] = VERSION
 
     (output / f"details_{index}.json").write_text(
         json.dumps(
@@ -642,33 +761,231 @@ def save_credits(index, item, sources):
     )
 
 
-def make_video(index, item):
-    title = str(
-        item.get("title")
-        or item.get("topic")
-        or "Trending Today"
-    )
+def render(
+    index,
+    item,
+    media,
+    audio,
+    folder,
+    short=False
+):
+    width = 1080 if short else WIDTH
+    height = 1920 if short else HEIGHT
 
-    audio = Path(f"audio/video_{index}.mp3")
-    video = output / f"video_{index}.mp4"
+    prefix = "short" if short else "video"
 
-    if not audio.exists():
-        raise FileNotFoundError(audio)
+    target = output / f"{prefix}_{index}.mp4"
 
     total = duration(audio)
 
     if total <= 0:
         raise RuntimeError("Invalid audio")
 
-    if total < 180:
-        print(
-            "WARNING: Video shorter than 3 minutes",
-            flush=True
-        )
+    if short and total > 180:
+        raise RuntimeError("Short narration too long")
 
     count = math.ceil(total / SCENE_TIME)
 
-    print("Creating:", title, flush=True)
+    scenes = []
+    used = []
+
+    for n in range(count):
+        seconds = min(
+            SCENE_TIME,
+            total - n * SCENE_TIME
+        )
+
+        if seconds <= 0:
+            break
+
+        scene = folder / f"{prefix}_scene_{n}.mp4"
+
+        created = False
+
+        for offset in range(len(media)):
+            position = (n + offset) % len(media)
+            source = media[position]
+
+            try:
+                make_scene(
+                    source,
+                    scene,
+                    seconds,
+                    width,
+                    height,
+                    n // len(media)
+                )
+
+                created = True
+
+                if position not in used:
+                    used.append(position)
+
+                break
+
+            except subprocess.CalledProcessError:
+                scene.unlink(missing_ok=True)
+
+        if not created:
+            raise RuntimeError("No valid scene")
+
+        scenes.append(scene)
+
+    concat = folder / f"{prefix}_concat.txt"
+
+    concat.write_text(
+        "\n".join(
+            f"file '{p.as_posix()}'"
+            for p in scenes
+        ),
+        encoding="utf-8"
+    )
+
+    combined = folder / f"{prefix}_combined.mp4"
+
+    ffmpeg([
+        "-f", "concat",
+        "-safe", "0",
+        "-i", str(concat),
+        "-c", "copy",
+        str(combined)
+    ])
+
+    hook = str(
+        item.get("short_title") if short
+        else item.get("opening_hook")
+        or item.get("title")
+        or "Trending Today"
+    )
+
+    hook = " ".join(hook.split()[:16])
+
+    hook_file = folder / f"{prefix}_hook.txt"
+
+    hook_file.write_text(
+        textwrap.fill(
+            hook,
+            width=24 if short else 40
+        ),
+        encoding="utf-8"
+    )
+
+    font_size = 54 if short else 56
+
+    filters = (
+        "drawbox=x=0:y=0:w=iw:h=8:"
+        "color=yellow:t=fill,"
+        f"drawtext=fontfile={FONT}:"
+        "text='TRENDPULSE GLOBAL':"
+        "fontsize=30:fontcolor=white:"
+        "box=1:boxcolor=0x071329@0.85:"
+        "boxborderw=12:x=35:y=45,"
+        f"drawtext=fontfile={FONT}:"
+        f"textfile={hook_file}:"
+        "expansion=none:"
+        f"fontsize={font_size}:"
+        "fontcolor=yellow:"
+        "borderw=3:bordercolor=black:"
+        "box=1:boxcolor=black@0.65:"
+        "boxborderw=15:"
+        "x=(w-tw)/2:y=(h-th)/2:"
+        "enable='lt(t,5)',"
+        f"drawtext=fontfile={FONT}:"
+        "text='Illustrative footage':"
+        "fontsize=22:fontcolor=white:"
+        "box=1:boxcolor=black@0.6:"
+        "x=30:y=110"
+    )
+
+    subtitles = find_subtitles(index, short)
+
+    if subtitles:
+        local_srt = folder / f"{prefix}_captions.srt"
+        local_srt.write_bytes(subtitles.read_bytes())
+
+        margin = 70 if short else 25
+
+        filters += (
+            f",subtitles={local_srt.as_posix()}:"
+            "force_style='FontName=DejaVu Sans,"
+            "FontSize=15,Bold=1,"
+            "PrimaryColour=&H00FFFFFF,"
+            "OutlineColour=&H00000000,"
+            "Outline=2,Shadow=1,"
+            f"Alignment=2,MarginV={margin}'"
+        )
+
+    temporary = folder / f"{prefix}_final.mp4"
+
+    command = [
+        "-stream_loop", "-1",
+        "-i", str(combined),
+        "-i", str(audio)
+    ]
+
+    music = Path("assets/background.mp3")
+    music_license = Path("assets/background_license.txt")
+
+    if (
+        music.exists()
+        and music_license.exists()
+        and music_license.stat().st_size
+    ):
+        command += [
+            "-stream_loop", "-1",
+            "-i", str(music),
+            "-filter_complex",
+            "[1:a]volume=1.0[voice];"
+            "[2:a]volume=0.035[bg];"
+            "[voice][bg]amix=inputs=2:"
+            "duration=first:normalize=0,"
+            "alimiter=limit=0.95[a]",
+            "-map", "0:v:0",
+            "-map", "[a]"
+        ]
+    else:
+        command += [
+            "-map", "0:v:0",
+            "-map", "1:a:0"
+        ]
+
+    ffmpeg(command + [
+        "-vf", filters,
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-threads", "2",
+        "-crf", "22",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-pix_fmt", "yuv420p",
+        "-t", str(total),
+        "-movflags", "+faststart",
+        str(temporary)
+    ])
+
+    temporary.replace(target)
+
+    print("SUCCESS:", target, flush=True)
+
+    return used
+
+
+def make_video(index, item):
+    audio = Path(f"audio/video_{index}.mp3")
+
+    if not audio.exists():
+        raise FileNotFoundError(audio)
+
+    total = duration(audio)
+
+    if total < 180:
+        print("WARNING: Video shorter than 3 minutes")
+
+    print(
+        "Creating:",
+        item.get("title", ""),
+        flush=True
+    )
 
     with tempfile.TemporaryDirectory() as temp:
         folder = Path(temp)
@@ -676,174 +993,96 @@ def make_video(index, item):
         media, sources = get_media(
             item,
             folder,
-            min(count, MAX_MEDIA)
+            min(
+                math.ceil(total / SCENE_TIME),
+                MAX_MEDIA
+            )
         )
 
         if len(media) < 3:
             raise RuntimeError(
-                "Insufficient relevant media. "
-                "Video skipped."
+                "Insufficient relevant media"
             )
 
-        scenes = []
-        used_media = []
-        used_sources = []
-
-        for n in range(count):
-            seconds = min(
-                SCENE_TIME,
-                total - n * SCENE_TIME
-            )
-
-            if seconds <= 0:
-                break
-
-            scene = folder / f"scene_{n}.mp4"
-            created = False
-
-            for offset in range(len(media)):
-                position = (n + offset) % len(media)
-                source = media[position]
-
-                try:
-                    make_scene(
-                        source,
-                        scene,
-                        seconds
-                    )
-
-                    created = True
-
-                    if source not in used_media:
-                        used_media.append(source)
-                        used_sources.append(
-                            sources[position]
-                        )
-
-                    break
-
-                except subprocess.CalledProcessError:
-                    scene.unlink(missing_ok=True)
-
-            if not created:
-                raise RuntimeError(
-                    "No valid scene available"
-                )
-
-            scenes.append(scene)
-
-        concat = folder / "concat.txt"
-
-        concat.write_text(
-            "\n".join(
-                f"file '{p.as_posix()}'"
-                for p in scenes
-            ),
-            encoding="utf-8"
+        used = render(
+            index,
+            item,
+            media,
+            audio,
+            folder
         )
-
-        combined = folder / "combined.mp4"
-
-        run([
-            "ffmpeg", "-y",
-            "-f", "concat",
-            "-safe", "0",
-            "-i", str(concat),
-            "-c", "copy",
-            "-loglevel", "error",
-            str(combined)
-        ])
-
-        title_file = folder / "title.txt"
-
-        title_file.write_text(
-            textwrap.fill(title, width=36),
-            encoding="utf-8"
-        )
-
-        filters = (
-            "drawbox=x=0:y=0:w=iw:h=8:"
-            "color=cyan:t=fill,"
-            f"drawtext=fontfile={FONT}:"
-            "text='TRENDPULSE GLOBAL':"
-            "fontsize=30:fontcolor=white:"
-            "box=1:boxcolor=0x071329@0.8:"
-            "boxborderw=12:x=35:y=35,"
-            f"drawtext=fontfile={FONT}:"
-            f"textfile={title_file}:"
-            "expansion=none:"
-            "fontsize=52:fontcolor=white:"
-            "box=1:boxcolor=black@0.75:"
-            "boxborderw=20:"
-            "x=(w-tw)/2:y=(h-th)/2:"
-            "enable='lt(t,3)',"
-            f"drawtext=fontfile={FONT}:"
-            "text='Illustrative footage':"
-            "fontsize=20:fontcolor=white:"
-            "box=1:boxcolor=black@0.6:"
-            "x=30:y=h-40"
-        )
-
-        subtitles = find_subtitles(index)
-
-        if subtitles:
-            filters += (
-                f",subtitles={subtitles.as_posix()}:"
-                "force_style='FontName=DejaVu Sans,"
-                "FontSize=17,Bold=1,"
-                "PrimaryColour=&H00FFFFFF,"
-                "OutlineColour=&H00000000,"
-                "Outline=2,Shadow=1,"
-                "Alignment=2,MarginV=28'"
-            )
-
-        temporary = folder / "final.mp4"
-
-        run([
-            "ffmpeg", "-y",
-            "-stream_loop", "-1",
-            "-i", str(combined),
-            "-i", str(audio),
-            "-map", "0:v:0",
-            "-map", "1:a:0",
-            "-vf", filters,
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-threads", "2",
-            "-crf", "22",
-            "-c:a", "aac",
-            "-b:a", "192k",
-            "-pix_fmt", "yuv420p",
-            "-t", str(total),
-            "-movflags", "+faststart",
-            "-loglevel", "error",
-            str(temporary)
-        ])
 
         make_thumbnail(
             index,
             item,
-            used_media,
+            [media[p] for p in used],
             folder
         )
+
+        short_audio = Path(
+            f"audio/short_{index}.mp3"
+        )
+
+        if short_audio.exists():
+            try:
+                short_used = render(
+                    index,
+                    item,
+                    media,
+                    short_audio,
+                    folder,
+                    short=True
+                )
+
+                used = list(dict.fromkeys(
+                    used + short_used
+                ))
+
+            except Exception as error:
+                print("Short skipped:", error)
+
+        else:
+            print(
+                "Short skipped: missing short audio",
+                flush=True
+            )
 
         save_credits(
             index,
             item,
-            used_sources
+            [sources[p] for p in used]
         )
 
-        temporary.replace(video)
+        music_license = Path(
+            "assets/background_license.txt"
+        )
 
-    print("SUCCESS:", video, flush=True)
+        if (
+            Path("assets/background.mp3").exists()
+            and music_license.exists()
+        ):
+            with open(
+                output / f"credits_{index}.txt",
+                "a",
+                encoding="utf-8"
+            ) as f:
+                f.write(
+                    "\nBackground music:\n" +
+                    music_license.read_text(
+                        encoding="utf-8"
+                    )
+                )
+
     return True
 
 
 success = 0
 
 for index, item in enumerate(topics, 1):
+
     for name in [
         f"video_{index}.mp4",
+        f"short_{index}.mp4",
         f"thumbnail_{index}.jpg",
         f"credits_{index}.txt",
         f"sources_{index}.json",
@@ -863,9 +1102,11 @@ for index, item in enumerate(topics, 1):
         )
 
 print(
-    f"TrendPulse AI V3.0: "
+    f"TrendPulse AI V{VERSION}: "
     f"{success}/{len(topics)} videos generated"
 )
 
 if success == 0:
-    raise RuntimeError("No suitable videos generated")
+    raise RuntimeError(
+        "No suitable videos generated"
+    )
