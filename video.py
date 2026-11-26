@@ -1,4 +1,3 @@
-
 import os
 import json
 import math
@@ -17,8 +16,10 @@ if not API_KEY:
 WIDTH = 1920
 HEIGHT = 1080
 FPS = 25
-SCENE_TIME = 6
-MAX_MEDIA = 35
+SCENE_TIME = 5
+MAX_MEDIA = 30
+
+FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
 output = Path("videos")
 output.mkdir(exist_ok=True)
@@ -29,8 +30,6 @@ with open("scripts.json", encoding="utf-8") as f:
 session = requests.Session()
 cache = {}
 
-FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-
 
 def run(cmd):
     subprocess.run(cmd, check=True)
@@ -40,66 +39,77 @@ def duration(path):
     result = subprocess.check_output([
         "ffprobe", "-v", "error",
         "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
         str(path)
     ])
     return float(result.strip())
 
 
-def keywords(title, item):
-    queries = []
-    topic = str(item.get("topic") or "")
-    script = str(item.get("script") or "")
-    content = (title + " " + topic + " " + script).lower()
+def keywords(item):
+    title = str(item.get("title", ""))
+    topic = str(item.get("topic", ""))
+    content = (title + " " + topic).lower()
 
-    categories = {
-        "basketball": [
-            "nba", "76ers", "basketball"
-        ],
-        "football": [
-            "soccer", "football", "fifa"
-        ],
-        "robot technology": [
-            "robot", "robotics"
-        ],
-        "artificial intelligence": [
-            "artificial intelligence", "chatgpt"
-        ],
-        "social media smartphone": [
-            "social media", "influencer", "tiktok"
-        ],
-        "stock market": [
-            "stock market", "finance", "economy"
-        ],
-        "space exploration": [
-            "nasa", "planet", "space"
-        ],
-        "storm weather": [
-            "storm", "hurricane", "weather"
-        ],
-        "electric car": [
-            "electric vehicle", "electric car", "tesla"
-        ],
-        "computer technology": [
-            "computer", "software", "technology"
-        ]
-    }
+    categories = [
+        (
+            ["nba", "basketball", "wembanyama"],
+            ["basketball court", "basketball player",
+             "basketball arena", "basketball hoop"]
+        ),
+        (
+            ["nfl", "garrett", "american football"],
+            ["american football", "football helmet",
+             "american football stadium"]
+        ),
+        (
+            ["soccer", "football", "fifa"],
+            ["soccer stadium", "soccer player",
+             "soccer ball"]
+        ),
+        (
+            ["robot", "artificial intelligence", "chatgpt"],
+            ["artificial intelligence", "robot technology",
+             "computer processor"]
+        ),
+        (
+            ["electric car", "tesla", "electric vehicle"],
+            ["electric car", "car charging",
+             "automotive technology"]
+        ),
+        (
+            ["finance", "stock", "economy", "interest rate"],
+            ["stock market", "financial chart",
+             "business meeting"]
+        ),
+        (
+            ["space", "nasa", "planet"],
+            ["space exploration", "rocket",
+             "planet earth"]
+        ),
+        (
+            ["celebrity", "marketing", "viral"],
+            ["social media", "content creator",
+             "digital marketing"]
+        )
+    ]
 
-    if topic:
-        queries.append(topic[:100])
-
-    queries.append(title.split(":")[0][:100])
-
-    for category, triggers in categories.items():
+    for triggers, queries in categories:
         if any(word in content for word in triggers):
-            queries.append(category)
+            return queries
 
-    clean = re.sub(r"[^a-zA-Z0-9 ]", " ", title)
-    queries.append(" ".join(clean.split()[:4]))
+    queries = item.get("visual_keywords", [])
 
-    return list(dict.fromkeys(
-        q.strip() for q in queries if q.strip()
-    ))
+    if not isinstance(queries, list):
+        queries = []
+
+    queries = [
+        q.strip()[:100]
+        for q in queries
+        if isinstance(q, str) and q.strip()
+    ]
+
+    return list(dict.fromkeys(queries))[:5]
 
 
 def search(query, media):
@@ -115,24 +125,24 @@ def search(query, media):
 
     params = {
         "key": API_KEY,
-        "q": query[:100],
+        "q": query,
         "per_page": 30,
-        "safesearch": "true"
+        "safesearch": "true",
+        "order": "popular"
     }
 
     if media == "image":
         params["image_type"] = "photo"
         params["orientation"] = "horizontal"
 
-    print("Searching:", query, media, flush=True)
-
     try:
         response = session.get(
-            endpoint, params=params, timeout=30
+            endpoint,
+            params=params,
+            timeout=30
         )
 
         if response.status_code != 200:
-            print("Pixabay HTTP:", response.status_code)
             return []
 
         hits = response.json().get("hits", [])
@@ -149,7 +159,6 @@ def download(url, path):
     ) as response:
 
         response.raise_for_status()
-
         size = 0
 
         with open(path, "wb") as f:
@@ -163,15 +172,58 @@ def download(url, path):
                     f.write(chunk)
 
 
-def get_media(title, item, folder, limit):
-    queries = keywords(title, item)
+def relevant(hit, query):
+    tags = str(hit.get("tags", "")).lower()
+
+    words = re.findall(
+        r"[a-z0-9]+", query.lower()
+    )
+
+    ignored = {
+        "the", "and", "with", "for",
+        "news", "global", "today"
+    }
+
+    words = [
+        w for w in words
+        if len(w) > 2 and w not in ignored
+    ]
+
+    if not words:
+        return False
+
+    return all(
+        re.search(r"\b" + re.escape(w) + r"s?\b", tags)
+        for w in words
+    )
+
+
+def get_media(item, folder, limit):
     files = []
     sources = []
     seen = set()
 
-    for media in ["video", "image"]:
-        for query in queries:
-            hits = search(query, media)
+    queries = keywords(item)
+
+    print("Visual keywords:", queries, flush=True)
+
+    pools = []
+
+    for query in queries:
+        for media in ["video", "image"]:
+            hits = [
+                hit for hit in search(query, media)
+                if relevant(hit, query)
+            ]
+
+            pools.append((query, media, iter(hits)))
+
+    while len(files) < limit and pools:
+        active = []
+
+        for query, media, hits in pools:
+            if len(files) >= limit:
+                break
 
             for hit in hits:
                 identity = (media, hit.get("id"))
@@ -212,17 +264,13 @@ def get_media(title, item, folder, limit):
                         "type": media
                     })
 
-                    print(
-                        "Downloaded media:", len(files),
-                        flush=True
-                    )
+                    active.append((query, media, hits))
+                    break
 
                 except Exception:
                     path.unlink(missing_ok=True)
-                    continue
 
-                if len(files) >= limit:
-                    return files, sources
+        pools = active
 
     return files, sources
 
@@ -234,29 +282,21 @@ def make_scene(source, target, seconds):
         f"crop={WIDTH}:{HEIGHT},setsar=1"
     )
 
+    command = ["ffmpeg", "-y"]
+
     if source.suffix.lower() == ".jpg":
-        frames = max(1, math.ceil(seconds * FPS))
-
-        command = [
-            "ffmpeg", "-y",
-            "-i", str(source),
-            "-vf",
-            base + ","
-            "zoompan=z='min(zoom+0.0005,1.10)':"
-            "x='iw/2-iw/zoom/2':"
-            "y='ih/2-ih/zoom/2':"
-            f"d={frames}:s={WIDTH}x{HEIGHT}:fps={FPS}"
+        command += [
+            "-loop", "1",
+            "-i", str(source)
         ]
-
     else:
-        command = [
-            "ffmpeg", "-y",
+        command += [
             "-stream_loop", "-1",
-            "-i", str(source),
-            "-vf", base
+            "-i", str(source)
         ]
 
     command += [
+        "-vf", base,
         "-t", f"{seconds:.3f}",
         "-an",
         "-r", str(FPS),
@@ -303,6 +343,48 @@ def find_subtitles(index):
     return None
 
 
+def make_thumbnail(index, item, combined, folder):
+    words = str(
+        item.get("thumbnail_text")
+        or item.get("topic")
+        or "TRENDING NOW"
+    ).split()[:4]
+
+    headline = textwrap.fill(
+        " ".join(words).upper(),
+        width=20
+    )
+
+    text_file = folder / "thumbnail.txt"
+    text_file.write_text(headline, encoding="utf-8")
+
+    filters = (
+        "scale=1280:720,"
+        "drawbox=x=0:y=0:w=iw:h=ih:"
+        "color=black@0.45:t=fill,"
+        f"drawtext=fontfile={FONT}:"
+        "text='TRENDPULSE GLOBAL':"
+        "fontsize=32:fontcolor=white:"
+        "x=35:y=35,"
+        f"drawtext=fontfile={FONT}:"
+        f"textfile={text_file}:"
+        "expansion=none:"
+        "fontsize=76:fontcolor=yellow:"
+        "borderw=4:bordercolor=black:"
+        "x=(w-tw)/2:y=(h-th)/2"
+    )
+
+    run([
+        "ffmpeg", "-y",
+        "-i", str(combined),
+        "-vf", filters,
+        "-frames:v", "1",
+        "-q:v", "3",
+        "-loglevel", "error",
+        str(output / f"thumbnail_{index}.jpg")
+    ])
+
+
 def make_video(index, item):
     title = str(
         item.get("title")
@@ -329,11 +411,13 @@ def make_video(index, item):
         folder = Path(temp)
 
         media, sources = get_media(
-            title,
             item,
             folder,
             min(count, MAX_MEDIA)
         )
+
+        if not media:
+            print("WARNING: No relevant footage found")
 
         scenes = []
 
@@ -347,12 +431,6 @@ def make_video(index, item):
                 break
 
             scene = folder / f"scene_{n}.mp4"
-
-            print(
-                f"Scene {n + 1}/{count}",
-                flush=True
-            )
-
             created = False
 
             for offset in range(len(media)):
@@ -398,28 +476,29 @@ def make_video(index, item):
         title_file = folder / "title.txt"
 
         title_file.write_text(
-            textwrap.fill(title, width=38),
+            textwrap.fill(title, width=36),
             encoding="utf-8"
         )
 
         filters = (
-            "drawbox=x=0:y=0:w=iw:h=10:"
+            "drawbox=x=0:y=0:w=iw:h=8:"
             "color=cyan:t=fill,"
             f"drawtext=fontfile={FONT}:"
-            "text='TRENDPULSE AI':"
-            "fontsize=38:fontcolor=white:"
+            "text='TRENDPULSE GLOBAL':"
+            "fontsize=32:fontcolor=white:"
             "box=1:boxcolor=black@0.7:"
-            "boxborderw=12:x=40:y=40,"
+            "boxborderw=10:x=40:y=40,"
             f"drawtext=fontfile={FONT}:"
             f"textfile={title_file}:"
             "expansion=none:"
-            "fontsize=48:fontcolor=white:"
+            "fontsize=52:fontcolor=white:"
             "box=1:boxcolor=black@0.75:"
             "boxborderw=18:"
             "x=(w-tw)/2:y=(h-th)/2:"
-            "enable='lt(t,6)',"
-            "drawtext=text='Illustrative footage':"
-            "fontsize=24:fontcolor=white:"
+            "enable='lt(t,3)',"
+            f"drawtext=fontfile={FONT}:"
+            "text='Illustrative footage':"
+            "fontsize=22:fontcolor=white:"
             "box=1:boxcolor=black@0.6:"
             "x=30:y=h-40"
         )
@@ -430,19 +509,11 @@ def make_video(index, item):
             filters += (
                 f",subtitles={subtitles.as_posix()}:"
                 "force_style='FontName=DejaVu Sans,"
-                "FontSize=22,Bold=1,"
+                "FontSize=17,Bold=1,"
                 "PrimaryColour=&H00FFFFFF,"
                 "OutlineColour=&H00000000,"
                 "Outline=2,Shadow=1,"
-                "Alignment=2,MarginV=25'"
-            )
-
-            print("Subtitles added", flush=True)
-
-        else:
-            print(
-                "No SRT subtitles found",
-                flush=True
+                "Alignment=2,MarginV=28'"
             )
 
         temporary = folder / "final.mp4"
@@ -470,8 +541,24 @@ def make_video(index, item):
 
         temporary.replace(video)
 
+        try:
+            make_thumbnail(
+                index, item, combined, folder
+            )
+        except subprocess.CalledProcessError:
+            print("WARNING: Thumbnail generation failed")
+
         (output / f"sources_{index}.json").write_text(
             json.dumps(sources, indent=2),
+            encoding="utf-8"
+        )
+
+        (output / f"details_{index}.json").write_text(
+            json.dumps(
+                item,
+                ensure_ascii=False,
+                indent=2
+            ),
             encoding="utf-8"
         )
 
